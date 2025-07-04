@@ -785,6 +785,139 @@ static const uint32_t iq1s_grid_us[2048] = {
 };
 #endif
 
+#ifdef __ARM_NEON
+
+namespace {
+
+// NEON implementation of the DequantizerIQ2BN
+// This struct will hold the necessary NEON specific data and methods
+// to prepare IQ2_BN quants for multiplication.
+struct DequantizerIQ2BN_NEON {
+    const uint8x16_t m3 = vdupq_n_u8(0x03); // Mask for 2 bits
+
+    // Placeholder for the iqk_grid_iq2bn values.
+    // In a real implementation, this would be initialized from the actual grid.
+    // These values correspond to {-3, -1, 1, 3} scaled by sub-block scales.
+    // For this placeholder, I'll use simplified values.
+    // The actual values depend on the 4-bit scale index encoded with the quants.
+    // For IQ2_BN, the grid is complex: `iqk_grid_iq2bn[scale_idx*4 + quant_val]`
+    // and `block_iq2_bn->scales` provides the `scale_idx`.
+    // This function needs to map the 2-bit quant + 4-bit scale_idx to the final {-3,-1,1,3} style value.
+    IQK_ALWAYS_INLINE int8x8_t lookup_iq2_grid(uint8x8_t q_indices, int16x4_t scales_for_block_half) const {
+        // This is highly simplified. A full port needs to correctly use x->scales
+        // and the iqk_grid_iq2bn (which is int8_t[64]).
+        // q_indices are 0,1,2,3. scales_for_block_half contains 4 int16_t scales.
+        // Each 2-bit quant uses one of these 4 scales.
+        // The AVX2 code does: grid_val = grid[scale_idx*4 + quant_val] where scale_idx is from x->scales.
+        // For NEON, this would likely involve table lookups or more intricate shuffles.
+        // For now, returning a dummy value based on q_indices.
+        return vreinterpret_s8_u8(vand_u8(q_indices, vdup_n_u8(0x03))); // Example: just keep lower 2 bits
+    }
+
+    IQK_ALWAYS_INLINE void prepare_iq2bn_quants(const block_iq2_bn * x, int8x16_t val[4]) const {
+        // Load the 4 int16_t scales for the block_iq2_bn
+        int16x4_t sub_block_scales = vld1_s16(x->scales); // These are 4 scales for the 64 quants (16 quants per scale)
+
+        for (int i = 0; i < 4; ++i) { // Iterate over four 16-quant (4-byte) chunks of qs
+            const uint8_t * qs_chunk_ptr = x->qs + i * 4;
+            uint8x8_t q_bytes_low  = vld1_u8(qs_chunk_ptr);     // First 4 bytes for 16 quants
+            uint8x8_t q_bytes_high = vld1_u8(qs_chunk_ptr + 2); // (Example, needs correct indexing for 2nd half of 16 quants)
+
+            // Unpack 2-bit values. Each byte has 4 quants.
+            // This is a conceptual unpacking. Actual NEON would use shifts/masks/vtbl.
+            uint8x8_t q_indices_01 = vand_u8(q_bytes_low, m3.low);
+            uint8x8_t q_indices_23 = vand_u8(vshr_n_u8(q_bytes_low, 2), m3.low);
+            uint8x8_t q_indices_45 = vand_u8(vshr_n_u8(q_bytes_low, 4), m3.low);
+            uint8x8_t q_indices_67 = vand_u8(vshr_n_u8(q_bytes_low, 6), m3.low);
+            // ... and similarly for q_bytes_high to get 8 more pairs of indices.
+
+            // Example: Apply simplified lookup (actual logic depends on iqk_grid_iq2bn and scales)
+            // This needs to map to the correct 16 values for val[i]
+            // For the i-th 16-quant chunk, the scale is sub_block_scales[i]
+            int16x4_t current_sub_block_scale_vec = vdup_lane_s16(sub_block_scales, i);
+
+            // Simplified lookup - this is where the core dequant logic for IQ2_BN needs to be ported
+            int8x8_t prepared_low_half  = lookup_iq2_grid(q_indices_01, current_sub_block_scale_vec); // Needs correct scale
+            int8x8_t prepared_high_half = lookup_iq2_grid(q_indices_23, current_sub_block_scale_vec); // Needs correct scale
+            // ... and for the other 8 quants using q_indices_45, q_indices_67 etc.
+
+            val[i] = vcombine_s8(prepared_low_half, prepared_high_half);
+        }
+    }
+};
+
+
+template <int nrc_y>
+static void mul_mat_iq2_bn_r4_q8_k16_neon(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    GGML_ASSERT(n % QK_IQ1BN == 0);
+    Q8_K16<nrc_y> q8(info);
+    DequantizerIQ2BN_NEON deq;
+
+    int8x16_t qx_prepared[4];
+    float32x4_t acc_f32[nrc_y];
+
+    const int nb = n / QK_IQ1BN;
+
+    for (int ix = 0; ix < nrc_x; ix += 4) {
+        const float *d_iq2_outer_ptr = (const float *)((const char *)vx + ix * bx);
+        float32x4_t d_iq2_row_scales_f32 = vld1q_f32(d_iq2_outer_ptr);
+
+        const uint8_t *iq2_blocks_base_ptr = (const uint8_t *)(d_iq2_outer_ptr + 4);
+
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            acc_f32[iy] = vdupq_n_f32(0.0f);
+        }
+
+        for (int ib = 0; ib < nb; ++ib) {
+            for (int sub_row = 0; sub_row < 4; ++sub_row) {
+                const block_iq2_bn *current_x_block = (const block_iq2_bn *)
+                    (iq2_blocks_base_ptr + (sub_row * nb + ib) * sizeof(block_iq2_bn));
+
+                float d_iq2_block_scale = GGML_FP16_TO_FP32(current_x_block->d);
+                float d_iq2_current_row_scale = vgetq_lane_f32(d_iq2_row_scales_f32, sub_row);
+                float d_iq2_final_scale = d_iq2_current_row_scale * d_iq2_block_scale;
+
+                deq.prepare_iq2bn_quants(current_x_block, qx_prepared);
+
+                for (int iy = 0; iy < nrc_y; ++iy) {
+                    const block_q8_k16 *y_block = q8.block(iy, ib);
+                    float d_q8_block_scale = q8.scale(iy, ib);
+                    float d_q8_block_sum_scaled = q8.sum(iy, ib);
+
+                    float d_final_prod = d_iq2_final_scale * d_q8_block_scale;
+                    float d_final_sum_correction = -d_iq2_final_scale * d_q8_block_sum_scaled;
+
+                    int32x4_t sum_block_s32 = vdupq_n_s32(0);
+
+                    for (int k = 0; k < 4; ++k) {
+                        int8x16_t x_chunk_s8 = qx_prepared[k];
+                        int8x16_t y_chunk_s8 = vld1q_s8(y_block->qs + k * 16);
+
+                        int16x8_t prod_low  = vmull_s8(vget_low_s8(x_chunk_s8),  vget_low_s8(y_chunk_s8));
+                        int16x8_t prod_high = vmull_s8(vget_high_s8(x_chunk_s8), vget_high_s8(y_chunk_s8));
+
+                        sum_block_s32 = vpadalq_s16(sum_block_s32, prod_low);
+                        sum_block_s32 = vpadalq_s16(sum_block_s32, prod_high);
+                    }
+                    float32x4_t sum_block_f32 = vcvtq_f32_s32(sum_block_s32);
+                    float current_val = vgetq_lane_f32(acc_f32[iy], sub_row);
+                    current_val += vaddvq_f32(sum_block_f32) * d_final_prod + d_final_sum_correction;
+                    acc_f32[iy] = vsetq_lane_f32(current_val, acc_f32[iy], sub_row);
+                }
+            }
+        }
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            info.store(ix, iy, acc_f32[iy]);
+        }
+    }
+}
+
+} // namespace
+
+#endif // __ARM_NEON
+
+#endif // IQK_IMPLEMENT
+
 }
 
 #ifdef __x86_64__

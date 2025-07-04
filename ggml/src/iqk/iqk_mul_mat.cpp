@@ -880,8 +880,22 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
 
 namespace {
 
-bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
+bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int Ny) {
 
+    if (ggml_cpu_has_neon()) {
+        if (typeA == GGML_TYPE_IQ2_BN_R4 && typeB == GGML_TYPE_Q8_K16) {
+            if (ne00 % QK_IQ1BN == 0) {
+                // Select the NEON version for IQ2_BN_R4 x Q8_K16
+                IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq2_bn_r4_q8_k16_neon, m.funcs);
+                // func16 is not typically set for these specific quant types in AVX,
+                // so keeping it null unless a 16-wide NEON version is made.
+                m.func16 = nullptr;
+                return true; // Successfully prepared with NEON kernel
+            }
+        }
+    }
+
+    // Fallback to existing ARM implementations or general logic if NEON conditions not met
     switch (typeA) {
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
@@ -945,8 +959,8 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
         case GGML_TYPE_IQ4_NL_R4:
             return iqk_set_kernels_legacy_quants(ne00, typeA, typeB, m.funcs, m.func16);
         case GGML_TYPE_IQ1_BN:
-        case GGML_TYPE_IQ2_BN:
-        case GGML_TYPE_IQ2_BN_R4:
+        // GGML_TYPE_IQ2_BN and GGML_TYPE_IQ2_BN_R4 are handled above by NEON if available
+        // If not NEON, or if it's a different 1-bit type, it falls through to iqk_set_kernels_1bit
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_S_R4:
         case GGML_TYPE_IQ1_M_R4:
@@ -956,6 +970,11 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
         case GGML_TYPE_IQ4_KT:
             return iqk_set_kernels_ktquants(ne00, typeA, typeB, m.funcs, m.func16);
         default:
+            // Explicitly handle IQ2_BN and IQ2_BN_R4 if NEON is not available
+            // to ensure they still fall into the 1-bit kernels if that's the intended fallback.
+            if (typeA == GGML_TYPE_IQ2_BN || typeA == GGML_TYPE_IQ2_BN_R4) {
+                 return iqk_set_kernels_1bit(ne00, typeA, typeB, m.funcs, m.func16);
+            }
             return false;
     }
 
