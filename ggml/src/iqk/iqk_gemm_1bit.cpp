@@ -916,7 +916,7 @@ static void mul_mat_iq2_bn_r4_q8_k16_neon(int n, const void * vx, size_t bx, con
 
 #endif // __ARM_NEON
 
-#endif // IQK_IMPLEMENT
+// #endif // IQK_IMPLEMENT // This line was removed
 
 }
 
