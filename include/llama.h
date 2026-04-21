@@ -13,6 +13,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __cplusplus
+#include <string>
+#endif
 #include <stdio.h>
 #include <stdbool.h>
 
@@ -529,6 +532,7 @@ extern "C" {
         bool dry_run;                        //
         bool partial_requant;                // quantize only missing split files in the split quantized .gguf destination directory
         void * imatrix;                      // pointer to importance matrix data
+        void * smart_quant_config;           // pointer to smart quant config (map<string, ggml_type>)
         void * kv_overrides;                 // pointer to vector containing overrides
         void * custom_quants;                // pointer to vector containing custom quantization rules
         void * repack_pattern;               // pointer to a vector containing regexes to be used for matching tensor names. Can be null

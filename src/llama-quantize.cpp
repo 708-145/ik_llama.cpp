@@ -13,10 +13,27 @@
 #include <mutex>
 #include <fstream>
 #include <filesystem>
+#include <map>
+
+#include "../vendor/nlohmann/json.hpp" // Added for nlohmann::json
 
 //
 // quantization
 //
+
+SmartQuantConfig load_smart_quant_config(const std::string & fname) {
+    SmartQuantConfig config;
+    std::ifstream f(fname);
+    if (!f.is_open()) {
+        throw std::runtime_error(format("failed to open smartquant config file %s", fname.c_str()));
+    }
+    nlohmann::json data = nlohmann::json::parse(f);
+
+    for (auto& el : data.items()) {
+        config[el.key()] = (ggml_type)el.value().get<int>();
+    }
+    return config;
+}
 
 // TODO: replace with ggml API call
 #define QK_K 256
@@ -1062,7 +1079,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     if (!params->only_repack && params->imatrix) {
         imatrix_data = static_cast<const std::unordered_map<std::string, std::vector<float>>*>(params->imatrix);
         if (imatrix_data) {
-            LLAMA_LOG_INFO("================================ Have weights data with %d entries\n",int(imatrix_data->size()));
+            LLAMA_LOG_INFO("================================ Have weights data with %zu entries\n", imatrix_data->size());
+            if (params->smart_quant_config) {
+                LLAMA_LOG_INFO("SmartQuant: parsed %zu entries\n", static_cast<const std::map<std::string, ggml_type>*>(params->smart_quant_config)->size());
+            }
             qs.has_imatrix = true;
             // check imatrix for nans or infs
             for (const auto & kv : *imatrix_data) {
@@ -1299,11 +1319,16 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         }
         ml.load_data_for(tensor);
 
-        LLAMA_LOG_INFO("[%4d/%4d] %36s - [%s], type = %6s, ",
+        // Calculate and print average bpw for each tensor
+        int64_t total_weights = ggml_nelements(tensor);
+        double avg_bpw = (8.0 * ggml_nbytes(tensor)) / total_weights;
+        LLAMA_LOG_INFO("[%4d/%4d] %36s - [%s], type = %6s, size = %8.3f MB (%.2f bpw)\n",
                ++idx, ml.n_tensors,
                ggml_get_name(tensor),
                llama_format_tensor_shape(tensor).c_str(),
-               ggml_type_name(tensor->type));
+               ggml_type_name(tensor->type),
+               ggml_nbytes(tensor)/1024.0/1024.0,
+               avg_bpw);
 
         // This used to be a regex, but <regex> has an extreme cost to compile times.
         bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
@@ -1342,7 +1367,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
         enum ggml_type new_type;
         void * new_data = nullptr;
         size_t new_size = 0;
-
+        
         if (params->only_repack) {
             ggml_type repacked_type = (ggml_type)iqk_repacked_type(tensor);
             bool modify = !is_repacked && iqk_should_modify_tensor(tensor);

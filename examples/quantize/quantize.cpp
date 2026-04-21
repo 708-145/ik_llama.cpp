@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "llama.h"
+#include "llama-quantize.h" // Include for SmartQuantConfig
 
 #include <cstdio>
 #include <cstring>
@@ -15,6 +16,8 @@
 #include <unordered_map>
 #include <fstream>
 #include <cmath>
+#include <memory> // For std::unique_ptr
+#include "../../vendor/nlohmann/json.hpp"
 
 struct quant_option {
     std::string name;
@@ -151,7 +154,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 //
 [[noreturn]]
 static void usage(const char * executable) {
-    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-split] [--partial-requant] [--override-kv] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
+    printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--hide-imatrix] [--ignore-imatrix-rules] [--dry-run] [--include-weights] [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--ffn-gate-inp-type] [--attn-q-type] [--attn-k-type] [--attn-v-type] [--attn-qkv-type] [--attn-output-type] [--ffn-gate-type] [--ffn-down-type] [--ffn-up-type] [--repack] [--repack-pattern] [--keep-split] [--partial-requant] [--override-kv] [--smartquant] model-f32.gguf [model-quant.gguf] type [nthreads]\n\n", executable);
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
     printf("  --pure: Disable k-quant mixtures and quantize all tensors to the same type\n");
@@ -180,6 +183,7 @@ static void usage(const char * executable) {
     printf("  --partial-requant: quantize only missing split files in the split quantized .gguf destination directory\n");
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("      Advanced option to override model metadata by key in the quantized model. May be specified multiple times.\n\n");
+    printf("  --smartquant file_name              path to a JSON file with quantization parameters\n");
     printf("Note: --include-weights and --exclude-weights cannot be used together\n");
     printf("Note: The token embeddings tensor is loaded in system RAM, even in case of full GPU/VRAM offload.\n");
     printf("Note: The recommanded type for the output tensor is q6_K for the ffn types > iq3_xxs and < q8_0.\n\n");
@@ -345,6 +349,7 @@ int main(int argc, char ** argv) {
 
     int arg_idx = 1;
     std::string imatrix_file;
+    std::string smartquant_file;
     std::vector<std::string> included_weights, excluded_weights;
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<CustomQ> custom_quants;
@@ -471,6 +476,12 @@ int main(int argc, char ** argv) {
             params.keep_split = true;
         } else if (strcmp(argv[arg_idx], "--partial-requant") == 0) {
             params.partial_requant = true;
+        } else if (strcmp(argv[arg_idx], "--smartquant") == 0) {
+            if (arg_idx < argc - 1) {
+                smartquant_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
         } else {
             usage(argv[0]);
         }
@@ -549,6 +560,13 @@ int main(int argc, char ** argv) {
     }
     if (!custom_quants.empty()) {
         params.custom_quants = &custom_quants;
+    }
+
+    // Load SmartQuant config if specified
+    std::unique_ptr<SmartQuantConfig> smart_quant_config_ptr;
+    if (!smartquant_file.empty()) {
+        smart_quant_config_ptr = std::make_unique<SmartQuantConfig>(load_smart_quant_config(smartquant_file));
+        params.smart_quant_config = smart_quant_config_ptr.get();
     }
 
     llama_backend_init();
