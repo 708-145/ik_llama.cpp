@@ -1417,6 +1417,16 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
             new_type = default_type;
 
+            // SmartQuant override
+            if (params->smart_quant_config) {
+                const auto & smart_quant_config = *static_cast<const std::map<std::string, ggml_type>*>(params->smart_quant_config);
+                auto it = smart_quant_config.find(name);
+                if (it != smart_quant_config.end()) {
+                    LLAMA_LOG_DEBUG("(SmartQuant override %s -> %s) ", ggml_type_name(new_type), ggml_type_name(it->second));
+                    new_type = it->second;
+                }
+            }
+
             // get more optimal quantization type based on the tensor shape, layer, etc.
             if (params->pure) {
                 auto working_type = change_type_if_necessary(new_type, tensor->ne[0], tensor->ne[1]);
